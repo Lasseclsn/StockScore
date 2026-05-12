@@ -1,13 +1,8 @@
-import logging
-import os
 import json
 from pathlib import Path
-import pandas as pd
-from google import genai
 import requests
 
 BASE_DIR = Path(__file__).parent
-SYSTEM_INSTRUCTION_PATH = BASE_DIR / "system_instruction.json"
 
 
 def load_api_key(key_name: str) -> str:
@@ -20,16 +15,6 @@ def load_api_key(key_name: str) -> str:
             return value.strip().strip('"').strip("'")
 
     raise RuntimeError("Kein API Key gefunden.")
-
-
-def create_agent() -> genai.Client:
-    """Create a Google GenAI client authenticated with an API key."""
-    return genai.Client(api_key=load_api_key("Gemini_API_KEY"))
-
-
-def load_system_instruction() -> str:
-    instruction = json.loads(SYSTEM_INSTRUCTION_PATH.read_text(encoding="utf-8"))
-    return json.dumps(instruction, ensure_ascii=False, indent=2)
 
 
 def getCik(ticker_symbol) -> str | None:
@@ -85,10 +70,13 @@ def get_latest_filing_by_form(submission_data, target_form: str):
     return None
 
 
-def fetch_and_save_filing(filing, cik, ticker_symbol, suffix, xbrl_api):
+def fetch_and_save_filing(filing, cik, ticker_symbol, suffix):
     if filing is None:
         print(f"Keine {suffix} Einreichung gefunden.")
         return
+
+    from sec_api import XbrlApi
+    xbrl_api = XbrlApi(api_key=load_api_key("SEC_API_KEY"))
 
     url = (
         "https://www.sec.gov/Archives/edgar/data/"
