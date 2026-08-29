@@ -45,10 +45,18 @@ def main() -> None:
         print(f"  10-Q: {latest_10q['filing_date'] if latest_10q else 'nicht gefunden'}")
         print(f"  8-K:  {latest_8k['filing_date']  if latest_8k  else 'nicht gefunden'}")
 
+        print("Lade Company Facts von SEC...")
+        company_facts = get_data.fetch_company_facts(cik)
+
         print("Lade Filings von SEC...")
-        get_data.fetch_and_save_filing(latest_10k, cik, ticker_symbol, "10k")
-        get_data.fetch_and_save_filing(latest_10q, cik, ticker_symbol, "10q")
-        get_data.fetch_and_save_filing(latest_8k,  cik, ticker_symbol, "8k")
+        get_data.fetch_and_save_filing(latest_10k, cik, ticker_symbol, "10k", company_facts)
+        get_data.fetch_and_save_filing(latest_10q, cik, ticker_symbol, "10q", company_facts)
+        get_data.fetch_and_save_filing(latest_8k,  cik, ticker_symbol, "8k", company_facts)
+
+        print("Lade Freitext-Abschnitte (Risk Factors, MD&A, Segmente) von SEC...")
+        get_data.fetch_and_save_filing_text(latest_10k, cik, ticker_symbol, "10k")
+        get_data.fetch_and_save_filing_text(latest_10q, cik, ticker_symbol, "10q")
+        get_data.fetch_and_save_filing_text(latest_8k,  cik, ticker_symbol, "8k")
 
         print("Lade Alpha Vantage Overview...")
         get_data.fetch_and_save_overview(ticker_symbol)

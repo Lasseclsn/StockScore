@@ -1,8 +1,8 @@
-# Finance Agent — Technical Documentation
-
-## Overview
+# Finance Agent
 
 A CLI tool that fetches SEC filings and market data for a given stock ticker, extracts structured financial metrics, applies a probabilistic scoring model (0–100), and runs four LLM analyses to predict whether a stock price is likely to rise or fall in the next quarter.
+
+**Scope**: SEC EDGAR only covers companies that file Form 10-K/10-Q — in practice, US-domiciled/US-listed companies. Foreign private issuers filing 20-F/40-F instead are not supported.
 
 ---
 
@@ -12,13 +12,14 @@ A CLI tool that fetches SEC filings and market data for a given stock ticker, ex
 finance_agent/
 ├── main.py          # Entry point + pipeline orchestration
 ├── extractor.py     # extract_10k(), extract_10q(), extract_vantage()
-├── xbrl_helpers.py  # XBRL label constants + all parsing/traversal helpers
+├── xbrl_helpers.py  # XBRL label constants + numeric fact pickers
+├── filing_text.py   # Free-text (Risk Factors/MD&A/Legal) + segment data from HTML/R-files
 ├── scorer.py        # Scoring model (knockout filters + 5 blocks)
-├── agent.py         # DeepSeek LLM agent (4 analysis functions)
+├── agent.py         # LLM agent (4 analysis functions, multi-provider)
 ├── get_data.py      # SEC/Alpha Vantage API calls, file I/O
 ├── .env             # API keys (not committed)
 ├── .env.example     # Key name reference
-├── output/          # JSON files saved per ticker
+├── output/          # JSON files saved per ticker (numeric + *_text.json)
 └── system_instruction.json
 ```
 
@@ -29,8 +30,7 @@ main.py
   ├── extractor.py  →  xbrl_helpers.py
   ├── scorer.py
   ├── agent.py
-  └── get_data.py
-        └── sec_api.XbrlApi  (lazy — imported only inside fetch_and_save_filing)
+  └── get_data.py  →  filing_text.py
 ```
 
 ---
@@ -39,16 +39,30 @@ main.py
 
 | Source | Data | API |
 |---|---|---|
-| SEC EDGAR (via sec-api.io) | 10-K, 10-Q, 8-K filings as XBRL JSON | `XbrlApi.xbrl_to_json()` |
-| SEC EDGAR (direct) | Company submission metadata, CIK lookup | `data.sec.gov/submissions/` |
+| SEC EDGAR (direct, free) | Ticker → CIK mapping | `sec.gov/files/company_tickers.json` |
+| SEC EDGAR (direct, free) | Company submission metadata, filing index | `data.sec.gov/submissions/` |
+| SEC EDGAR (direct, free) | Structured XBRL financial facts (10-K/10-Q/8-K) | `data.sec.gov/api/xbrl/companyfacts/` |
+| SEC EDGAR (direct, free) | Free text (Risk Factors, MD&A, Legal Proceedings), 8-K items | Primary filing HTML at `sec.gov/Archives/edgar/data/{cik}/{accession}/{primaryDocument}` |
+| SEC EDGAR (direct, free) | Segment revenue/margin | Pre-rendered R-files, located via `FilingSummary.xml` in the same accession folder |
 | Alpha Vantage | Market data, valuation multiples, analyst ratings | `OVERVIEW` endpoint |
 
-### API Keys required (`.env` format: `Key: "value"`)
+All SEC endpoints are free and require no API key — only a descriptive `User-Agent` header, read from `.env` (see Setup below).
+
+### `filing_text.py` — HTML scraping layer
+
+`get_data.fetch_and_save_filing_text()` additionally downloads the primary filing document (HTML) and saves the extracted sections as `{TICKER}_{suffix}_text.json` next to the numeric file. `extractor.py` reads this companion file automatically — if it's missing, the affected fields stay empty (no crash).
+
+- **10-K/10-Q free text** (`get_10k_sections()`/`get_10q_sections()`): section headings ("Item 1A. Risk Factors") are detected structurally rather than by text convention, since filers vary between ALL CAPS and mixed case — a heading is a tag whose own text is short and starts exactly with "Item N.". With multiple matches (table of contents vs. real heading), the longer tag wins, or the later one on a tie. Body text is then collected by walking forward in the DOM until the next heading.
+- **8-K items** (`get_8k_items()`): 8-Ks are structurally simpler (heading and text often share one tag), so this scans the flattened text linearly for the SEC-wide `Item X.XX.` decimal format instead.
+- **Segments** (`get_segment_data()`): SEC pre-renders a report (R1.htm, R2.htm, ...) for every XBRL disclosure, indexed in `FilingSummary.xml`. The matching R-file (ShortName containing "segment" + "revenue"/"sales") gets parsed; scale annotations ("$ in Millions" etc.) are normalized to raw USD to stay comparable with companyfacts. Revenue row labels vary by filer ("Revenue", "Sales to customers", "Net sales", ...) — an alias list covers the common ones. Repeating boilerplate sub-header rows are detected by frequency, not fixed text. Filers with very granular breakdowns (geography × product line) are capped to the 10 largest segments by revenue.
+
+### Environment variables (`.env` format: `Key: "value"`)
 
 ```
-SEC_API_KEY
+SEC_USER_AGENT          # e.g. "YourAppName you@example.com" — required by SEC, no key needed
 Alpha_Vantage_API_KEY
-DeepSeek_API_KEY
+LLM_API_KEY
+LLM_PROVIDER            # deepseek | openai | gemini | groq
 ```
 
 ---
@@ -76,7 +90,7 @@ scorer.score()  → knockout filters → 5 scoring blocks → probability_up
         │
         ▼
 agent.analyze()           → overall assessment + direction
-agent.analyze_mda()       → MD&A reconstruction from numbers
+agent.analyze_mda()       → MD&A synthesis from scraped text + numbers
 agent.extract_guidance()  → implicit forward-looking signals
 agent.explain_anomalies() → weak block identification + discrepancies
 ```
@@ -104,13 +118,14 @@ Handles all external API calls and file I/O. No scoring or extraction logic.
 | Function | Purpose |
 |---|---|
 | `load_api_key(key_name)` | Reads a key from `.env` (format: `Key: "value"`) |
-| `getCik(ticker)` | Resolves ticker to SEC CIK via sec-api.io |
+| `getCik(ticker)` | Resolves ticker to SEC CIK via SEC's free `company_tickers.json` |
 | `getSubmissionData(cik)` | Fetches filing index from `data.sec.gov` |
 | `get_latest_filing_by_form(data, form)` | Returns most recent filing of given type (10-K, 10-Q, 8-K) |
-| `fetch_and_save_filing(filing, cik, ticker, suffix)` | Converts filing to XBRL JSON via sec-api.io, saves to `output/` |
+| `fetch_company_facts(cik)` | Fetches **all** structured XBRL facts for the company from `data.sec.gov/api/xbrl/companyfacts/` (one call per ticker, covers every filing) |
+| `fetch_and_save_filing(filing, cik, ticker, suffix, company_facts)` | Filters `company_facts` down to the facts reported under one filing's accession number, saves to `output/` |
 | `fetch_and_save_overview(ticker)` | Fetches Alpha Vantage OVERVIEW, saves to `output/` |
 
-> `XbrlApi` is imported **lazily** inside `fetch_and_save_filing()` to avoid slow startup — the sec-api library loads heavy dependencies (pandas, numpy) and would otherwise block the prompt by several minutes.
+> **Note on format compatibility**: `_to_period_item()` converts each raw SEC fact (`{"val", "start", "end", "accn", ...}`) into the `{"value", "period": {"startDate"/"endDate" or "instant"}}` shape that `xbrl_helpers.py` expects, so the extraction layer below needed no changes.
 
 ---
 
@@ -137,20 +152,16 @@ Each filing type has a mapping dict with fallback chains of XBRL concept names p
 | `_walk(obj, path)` | Recursive JSON walker yielding `(path, key, value)` tuples |
 | `_find_key(obj, key)` | Exact recursive key lookup |
 | `_get_by_path(obj, path)` | Dot-path accessor (e.g. `"CoverPage.DocumentFiscalPeriodFocus"`) |
-| `_pick(data, names)` | Most recent unsegmented numeric fact from a fallback name list |
+| `_pick(data, names)` | Most recent unsegmented numeric fact from a fallback name list; on a tied end date, prefers the shortest duration (avoids picking a 9-month YTD figure over the actual 3-month quarter) |
 | `_pick_all_periods(data, names)` | `{end_date: value}` for all periods — used for multi-year trends |
 | `_pick_prior_instant(data, names)` | Second most recent instant value (prior fiscal year balance sheet) |
 | `_pick_for_period(data, names, start, end)` | Fact for a specific date range — used for YoY/QoQ derivation |
 | `_latest_duration_fact(data, names)` | Most recent duration fact with both start and end date |
-| `_extract_segment_data(data)` | Revenue + gross profit by business segment via XBRL segment axis |
 | `_safe_change(current, previous)` | `(current - previous) / previous`, returns `None` on division by zero |
 | `_derive_yoy_change(data)` | Revenue YoY from prior-year quarter in same filing |
 | `_derive_qoq_change(data)` | Revenue QoQ if prior quarter is present in same filing |
-| `_mda_highlights(data)` | Up to 3 key sentences from MD&A section |
-| `_liquidity_text(data)` | Liquidity & Capital Resources section text |
-| `_results_text(data)` | Results of Operations section text |
-| `_risk_factor_summary(data)` | Risk Factors section text |
-| `_legal_summary(data)` | Legal Proceedings section text |
+
+Free-text and segment extraction (formerly here) now live in [filing_text.py](filing_text.py) — see above.
 
 ---
 
@@ -178,14 +189,14 @@ Returns from the most recent annual filing:
     "gross_margin_pct", "operating_margin_pct", "net_margin_pct"
     # All as {end_date: value} dicts across all available years
   },
-  "risk_factors": ["sentence 1", ...],   # up to 5 sentences containing "risk"
-  "mda_highlights": ["sentence 1", ...]  # up to 3 MDA key sentences
+  "risk_factors": ["sentence 1", ...],   # first sentences of the scraped Item 1A section
+  "mda_highlights": ["sentence 1", ...]  # first sentences of the scraped Item 7 (MD&A) section
 }
 ```
 
 **`gross_profit` fallback**: If the company does not report `GrossProfit` as an XBRL concept (e.g. Alphabet), it is derived as `Revenue − CostOfRevenue`. The same fallback applies to multi-year trend data.
 
-**Risk factor extraction**: Text is capped at 2,000,000 characters before regex search to prevent catastrophic backtracking on large filings.
+**`risk_factors`/`mda_highlights` source**: read from the `{TICKER}_10k_text.json` companion file produced by `filing_text.get_10k_sections()` (see above) — empty if that file is missing.
 
 ### `extract_10q(path)` → dict
 
@@ -394,11 +405,11 @@ Skipped entirely for financial companies. For non-financials: Z < 1.1 = Knockout
 
 ---
 
-## `agent.py` — DeepSeek LLM Agent
+## `agent.py` — LLM Agent
 
-**Model**: `deepseek-chat` (DeepSeek-V3) via OpenAI-compatible REST API at `https://api.deepseek.com/chat/completions`. Temperature 0.3.
+**Provider**: configurable via `.env` (`LLM_PROVIDER`: deepseek | openai | gemini | groq, or a custom `LLM_URL`/`LLM_MODEL` for e.g. local Ollama). Default model per provider in `_PROVIDER_DEFAULTS`. Temperature 0.3.
 
-All four functions share `_call_deepseek(system, user, max_tokens)`.
+All four functions share `_call_llm(system, user, max_tokens)`.
 
 ### `analyze()` — Overall assessment (600 tokens)
 
@@ -406,7 +417,7 @@ Receives full score breakdown, key financials, segment data, analyst consensus. 
 
 ### `analyze_mda()` — MD&A reconstruction (700 tokens)
 
-XBRL does not contain narrative text. DeepSeek reconstructs the likely management discussion from multi-year numerical trends (revenue, margins, OCF, segments, liquidity). Output: three sections — quarterly results, liquidity, key risks.
+Combines the real Item 1A/Item 7 risk-factor and MD&A excerpts scraped by `filing_text.py` with multi-year numerical trends (revenue, margins, OCF, segments, liquidity) — the LLM synthesizes both into a coherent discussion rather than reconstructing purely from numbers. Output: three sections — quarterly results, liquidity, key risks.
 
 ### `extract_guidance()` — Implicit forward signals (500 tokens)
 
@@ -424,20 +435,36 @@ Ranks scoring blocks by fill rate, identifies metrics with 0 points, detects cro
 |---|---|
 | [main.py](main.py) | Entry point, cache check, pipeline orchestration |
 | [extractor.py](extractor.py) | `extract_10k`, `extract_10q`, `extract_vantage` |
-| [xbrl_helpers.py](xbrl_helpers.py) | Label constants, XBRL traversal, text helpers |
+| [xbrl_helpers.py](xbrl_helpers.py) | Label constants, numeric XBRL fact pickers |
+| [filing_text.py](filing_text.py) | Freitext (Risk Factors/MD&A/Legal) + Segmentdaten aus HTML/R-Files |
 | [scorer.py](scorer.py) | Knockout filters + 5 scoring blocks |
-| [agent.py](agent.py) | DeepSeek LLM analyses |
-| [get_data.py](get_data.py) | API calls, file I/O, lazy XbrlApi import |
+| [agent.py](agent.py) | Multi-provider LLM analyses |
+| [get_data.py](get_data.py) | SEC/Alpha Vantage API calls, file I/O |
 
 ---
+
+## Setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install requests beautifulsoup4 lxml
+```
+
+Create `.env` (see `.env.example`) with:
+
+```
+SEC_USER_AGENT: "YourAppName your-email@example.com"   # required by SEC, not a real key
+Alpha_Vantage_API_KEY: "your_alpha_vantage_key_here"
+LLM_API_KEY:  "your_llm_api_key_here"
+LLM_PROVIDER: "deepseek"   # deepseek | openai | gemini | groq
+```
+
+SEC EDGAR needs no API key — only the `User-Agent` header above, read at request time in `get_data._sec_headers()` / `filing_text._sec_headers()`.
 
 ## Running the Agent
 
 ```bash
-# Activate virtual environment
-source .venv/bin/activate
-
-# Run
 python main.py
 # → Enter ticker symbol when prompted (e.g. TSLA, AAPL, MSFT)
 # → If cached data exists, you will be asked whether to reuse it
@@ -446,23 +473,27 @@ python main.py
 Output sequence:
 1. Cache check — reuse or re-fetch
 2. Filing dates found (10-K, 10-Q, 8-K)
-3. Download + conversion via sec-api.io (~30–90 s)
+3. Download from SEC's free XBRL API (companyfacts, one call per ticker) + primary filing HTML (text sections, segments)
 4. Score block breakdown
-5. DeepSeek: overall assessment
-6. DeepSeek: MD&A analysis
-7. DeepSeek: implicit guidance
-8. DeepSeek: anomaly explanation
+5. LLM: overall assessment
+6. LLM: MD&A analysis
+7. LLM: implicit guidance
+8. LLM: anomaly explanation
 
-JSON output files are saved to `output/<TICKER>_10k.json`, `_10q.json`, `_8k.json`, `_vantage.json`.
+JSON output files are saved to `output/<TICKER>_10k.json`, `_10q.json`, `_8k.json`, `_vantage.json`, plus `_10k_text.json`/`_10q_text.json`/`_8k_text.json` for the scraped free-text/segment data.
 
 ---
 
 ## Known Limitations
 
-- **No narrative MD&A text**: XBRL JSON does not include the free-text sections of SEC filings. DeepSeek reconstructs the likely discussion from numbers.
+- **US filers only**: SEC EDGAR only has 10-K/10-Q filings for companies registered with the SEC — practically, US-domiciled/US-listed companies. Foreign private issuers filing 20-F/40-F are not covered.
+- **Free text/segments are best-effort HTML scraping**: `companyfacts` only returns numbers, so `risk_factors`, `mda_highlights`, `mda_updates`, `risk_factor_changes`, `legal_proceedings` (10-K/10-Q) and `segments` (10-Q) come from `filing_text.py` scraping the primary filing HTML / SEC R-files directly. Verified against two differently-formatted filers (Microsoft, Johnson & Johnson), but without the schema guarantee `companyfacts` has, since EDGAR HTML isn't structured consistently across filers. Known edge cases:
+  - A 10-Q can legitimately omit Item 1A (Risk Factors) if nothing changed since the last 10-K — `risk_factor_change_summary` is then `None`, not a bug.
+  - `liquidity_capital_resources` (10-Q) is only populated if the exact sub-heading "Liquidity and Capital Resources" appears within the MD&A text.
+  - Segment tables vary a lot by filer: some combine revenue, cost, and operating income in one table (full gross-margin calculation possible), others report sales only (`gross_profit`/`gross_margin_pct` then stays `None`). Filers with very granular breakdowns (geography × product line) are capped to the 10 largest "segments" by revenue.
 - **`GrossProfit` not reported by all companies**: Some companies (e.g. Alphabet) only report `CostOfRevenue`. The extractor derives gross profit as `Revenue − CostOfRevenue` automatically.
 - **QoQ change**: Only available if the prior quarter data is present in the same 10-Q filing (usually not).
-- **Segment extraction**: Relies on the `StatementBusinessSegmentsAxis` XBRL dimension. Companies without XBRL segment tagging return empty segment data.
 - **Probability range capped at 25%–75%**: By design — the model does not claim certainty.
 - **Alpha Vantage free tier**: Limited to 25 API calls/day. `Forward P/E`, `PEG`, analyst ratings may be unavailable for smaller tickers.
 - **Missing filings**: If a filing cannot be fetched (API error or not found), the corresponding extraction step is skipped gracefully.
+- **SEC rate limits**: `data.sec.gov`/`www.sec.gov` allow up to ~10 requests/second and require the `User-Agent` header set via `SEC_USER_AGENT` — otherwise requests are blocked with a 403.

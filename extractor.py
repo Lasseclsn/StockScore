@@ -1,4 +1,3 @@
-import re
 import json
 from pathlib import Path
 
@@ -11,17 +10,21 @@ from xbrl_helpers import (
     _pick_all_periods,
     _pick_for_period,
     _get_by_path,
-    _collect_text,
-    _mda_highlights,
-    _liquidity_text,
-    _results_text,
-    _risk_factor_summary,
-    _legal_summary,
-    _extract_segment_data,
     _derive_yoy_change,
     _derive_qoq_change,
     _safe_change,
 )
+
+
+def _load_text_companion(path) -> dict:
+    """Lädt die von filing_text.py erzeugte {TICKER}_{suffix}_text.json, falls vorhanden."""
+    text_path = Path(str(path).replace(".json", "_text.json"))
+    if not text_path.exists():
+        return {}
+    try:
+        return json.loads(text_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 def extract_vantage(path) -> dict:
@@ -106,6 +109,7 @@ def extract_vantage(path) -> dict:
 
 def extract_10k(path) -> dict:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
+    text = _load_text_companion(path)
 
     metrics = {k: _pick(data, v) for k, v in LABELS_10k.items()}
 
@@ -175,19 +179,17 @@ def extract_10k(path) -> dict:
         "net_margin_pct":      _sorted(_margin_trend(ni_periods, rev_periods)),
     }
 
-    text = re.sub(r"\s+", " ", " ".join(_collect_text(data)))[:2_000_000]
-    risk_sents = re.findall(r"[^.]{0,200}risk[^.]{0,200}\.", text, flags=re.I)[:5]
-
     return {
-        "metrics":      metrics,
-        "trends":       trends,
-        "risk_factors": [s.strip() for s in risk_sents],
-        "mda_highlights": _mda_highlights(data),
+        "metrics":        metrics,
+        "trends":         trends,
+        "risk_factors":   text.get("risk_factors", []),
+        "mda_highlights": text.get("mda_highlights", []),
     }
 
 
 def extract_10q(path) -> dict:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
+    text = _load_text_companion(path)
 
     out = {
         "core_metrics":       {},
@@ -253,7 +255,7 @@ def extract_10q(path) -> dict:
     out["core_metrics"]["total_assets_prior"]  = ta_prior
     out["core_metrics"]["leverage_ratio_prior"] = round(td_prior / ta_prior, 4) if td_prior and ta_prior else None
 
-    out["segments"] = _extract_segment_data(data)
+    out["segments"] = text.get("segments", {})
 
     for key, names in LABELS_10Q["comparisons"].items():
         out["comparisons"][key] = _pick_any(data, names)
@@ -274,15 +276,15 @@ def extract_10q(path) -> dict:
         or out["comparisons"].get("document_period_end")
     )
 
-    out["mda_updates"]["liquidity_capital_resources"] = _liquidity_text(data)
-    out["mda_updates"]["results_of_operations"]       = _results_text(data)
-    out["mda_updates"]["highlights"]                  = _mda_highlights(data)
+    out["mda_updates"]["liquidity_capital_resources"] = text.get("liquidity_capital_resources")
+    out["mda_updates"]["results_of_operations"]       = text.get("results_of_operations")
+    out["mda_updates"]["highlights"]                  = text.get("highlights", [])
 
-    risk_text = _risk_factor_summary(data)
+    risk_text = text.get("risk_factor_change_summary")
     out["risk_factor_changes"]["risk_factor_change_summary"] = risk_text
     out["risk_factor_changes"]["risk_factor_changes_flag"]   = bool(risk_text)
 
-    legal_text = _legal_summary(data)
+    legal_text = text.get("legal_proceedings_summary")
     out["legal_proceedings"]["legal_proceedings_summary"]    = legal_text
     out["legal_proceedings"]["legal_proceedings_update_flag"] = bool(legal_text)
 

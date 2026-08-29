@@ -423,9 +423,18 @@ def _pick_any(data, names):
     return None
 
 
+def _duration_days(start, end):
+    try:
+        from datetime import date as dt
+        return (dt.fromisoformat(end) - dt.fromisoformat(start)).days
+    except Exception:
+        return None
+
+
 def _pick(data, names):
     best = None
     best_date = ""
+    best_duration = None
     for name in names:
         facts = _find_key(data, name)
         if not isinstance(facts, list):
@@ -439,11 +448,17 @@ def _pick(data, names):
                 continue
             val = _value(item)
             date = _period_end(item)
-            if val is None:
+            if val is None or not date:
                 continue
+            period = item.get("period", {})
+            duration = _duration_days(period.get("startDate"), date) if period.get("startDate") else None
             if date > best_date:
                 best_date = date
                 best = val
+                best_duration = duration
+            elif date == best_date and duration is not None and (best_duration is None or duration < best_duration):
+                best = val
+                best_duration = duration
     return best
 
 
@@ -547,99 +562,6 @@ def _pick_prior_instant(data, names):
 
 
 # ---------------------------------------------------------------------------
-# Segment extraction
-# ---------------------------------------------------------------------------
-
-def _extract_segment_data(data):
-    section_key = (
-        "SegmentReportingandInformationaboutGeographicAreas"
-        "ScheduleofTotalRevenuesandGrossProfitbyReportableSegmentDetails"
-    )
-    seg_section = data.get(section_key, {})
-    BUS_SEG_DIM = "us-gaap:StatementBusinessSegmentsAxis"
-
-    def _is_quarter(start, end):
-        try:
-            from datetime import date as dt
-            s = dt.fromisoformat(start)
-            e = dt.fromisoformat(end)
-            return 80 <= (e - s).days <= 100
-        except Exception:
-            return False
-
-    def _seg_label(raw):
-        label = raw.split(":")[-1]
-        for suffix in ("SegmentMember", "Segment", "Member"):
-            if label.endswith(suffix):
-                label = label[: -len(suffix)]
-                break
-        return label
-
-    def _collect_seg_facts(field_name):
-        facts = seg_section.get(field_name, [])
-        result = {}
-        for item in facts:
-            if not isinstance(item, dict):
-                continue
-            seg = item.get("segment", {})
-            em = seg.get("explicitMember", {}) if isinstance(seg, dict) else {}
-            if em.get("dimension") != BUS_SEG_DIM:
-                continue
-            label = _seg_label(em.get("$t", ""))
-            period = item.get("period", {})
-            start = period.get("startDate")
-            end = period.get("endDate")
-            if not start or not end:
-                continue
-            val = _value(item)
-            if val is None:
-                continue
-            result.setdefault(label, {})[(start, end)] = val
-        return result
-
-    rev_by_seg = _collect_seg_facts("Revenues")
-    gp_by_seg = _collect_seg_facts("GrossProfit")
-
-    all_periods = set()
-    for seg_data in rev_by_seg.values():
-        for start, end in seg_data:
-            if _is_quarter(start, end):
-                all_periods.add((start, end))
-
-    if not all_periods:
-        return {}
-
-    latest_start, latest_end = max(all_periods, key=lambda x: x[1])
-
-    try:
-        prev_start = f"{int(latest_start[:4]) - 1}{latest_start[4:]}"
-        prev_end = f"{int(latest_end[:4]) - 1}{latest_end[4:]}"
-        prev_period = (prev_start, prev_end)
-    except Exception:
-        prev_period = None
-
-    segments = {}
-    for label in set(rev_by_seg) | set(gp_by_seg):
-        rev = rev_by_seg.get(label, {}).get((latest_start, latest_end))
-        gp = gp_by_seg.get(label, {}).get((latest_start, latest_end))
-        rev_prev = rev_by_seg.get(label, {}).get(prev_period) if prev_period else None
-        gp_prev = gp_by_seg.get(label, {}).get(prev_period) if prev_period else None
-
-        segments[label] = {
-            "revenue": rev,
-            "gross_profit": gp,
-            "gross_margin_pct": round(gp / rev, 4) if rev and gp else None,
-            "revenue_yoy_change": _safe_change(rev, rev_prev),
-            "gross_margin_pct_prior_year": round(gp_prev / rev_prev, 4) if rev_prev and gp_prev else None,
-        }
-
-    return {
-        "period": {"start": latest_start, "end": latest_end},
-        "segments": segments,
-    }
-
-
-# ---------------------------------------------------------------------------
 # YoY / QoQ derivations
 # ---------------------------------------------------------------------------
 
@@ -682,180 +604,3 @@ def _derive_qoq_change(data):
     return _safe_change(latest["value"], previous)
 
 
-# ---------------------------------------------------------------------------
-# Text collection
-# ---------------------------------------------------------------------------
-
-def _collect_text(obj):
-    parts = []
-    for path, k, v in _walk(obj):
-        if isinstance(v, str):
-            cleaned = _clean(v)
-            if cleaned:
-                parts.append(cleaned)
-    return parts
-
-
-def _find_text_blocks_by_path(data, keywords, min_len=30):
-    if isinstance(keywords, str):
-        keywords = [keywords]
-    keywords = [str(kw).lower() for kw in keywords if kw]
-    hits = []
-    for path, k, v in _walk(data):
-        if not isinstance(v, str):
-            continue
-        cleaned = _clean(v)
-        if not cleaned or len(cleaned) < min_len:
-            continue
-        haystack_path = f"{path} {k}".lower()
-        if any(kw in haystack_path for kw in keywords):
-            hits.append({"path": path, "text": cleaned})
-    return hits
-
-
-def _find_text_blocks_by_heading(data, headings, min_len=30):
-    if isinstance(headings, str):
-        headings = [headings]
-    headings = [str(h).lower() for h in headings if h]
-    hits = []
-    for path, k, v in _walk(data):
-        if not isinstance(v, str):
-            continue
-        cleaned = _clean(v)
-        if not cleaned or len(cleaned) < min_len:
-            continue
-        text_l = cleaned.lower()
-        for heading in headings:
-            if heading in text_l[:1500]:
-                hits.append({"path": path, "text": cleaned})
-                break
-    return hits
-
-
-def _get_section_text_by_path(data, section_names, limit_chars=None):
-    hits = _find_text_blocks_by_path(data, section_names)
-    seen = set()
-    parts = []
-    for hit in hits:
-        text = hit["text"]
-        if text and text not in seen:
-            seen.add(text)
-            parts.append(text)
-    result = " ".join(parts).strip()
-    if limit_chars and result:
-        return result[:limit_chars]
-    return result or None
-
-
-def _get_section_text_by_heading(data, headings, limit_chars=None):
-    hits = _find_text_blocks_by_heading(data, headings)
-    seen = set()
-    parts = []
-    for hit in hits:
-        text = hit["text"]
-        if text and text not in seen:
-            seen.add(text)
-            parts.append(text)
-    result = " ".join(parts).strip()
-    if limit_chars and result:
-        return result[:limit_chars]
-    return result or None
-
-
-def _mda_highlights(data, limit=3):
-    text = _get_section_text_by_path(
-        data,
-        [
-            "ManagementDiscussionAndAnalysis",
-            "ManagementsDiscussionAndAnalysis",
-            "ResultsOfOperations",
-            "LiquidityAndCapitalResources",
-        ],
-        limit_chars=12000,
-    )
-    if not text:
-        return []
-    sents = re.split(r"(?<=[.!?])\s+", text)
-    out = []
-    for s in sents:
-        ls = s.lower()
-        if any(
-            x in ls
-            for x in [
-                "results of operations",
-                "liquidity",
-                "capital resources",
-                "cash",
-                "gross profit",
-                "operating income",
-                "revenue",
-            ]
-        ):
-            cleaned = s.strip()
-            if cleaned and cleaned not in out:
-                out.append(cleaned)
-        if len(out) == limit:
-            break
-    return out
-
-
-def _liquidity_text(data, limit_chars=3000):
-    return _get_section_text_by_path(
-        data,
-        ["LiquidityAndCapitalResources", "LiquidityCapitalResources", "CapitalResources"],
-        limit_chars=limit_chars,
-    )
-
-
-def _results_text(data, limit_chars=3000):
-    return _get_section_text_by_path(
-        data,
-        [
-            "ResultsOfOperations",
-            "ManagementDiscussionAndAnalysis",
-            "ManagementsDiscussionAndAnalysis",
-        ],
-        limit_chars=limit_chars,
-    )
-
-
-def _risk_factor_summary(data, limit_chars=3000):
-    text = _get_section_text_by_path(
-        data,
-        ["RiskFactors", "RiskFactor", "PartIIItem1A"],
-        limit_chars=limit_chars,
-    )
-    if text:
-        return text
-    return _get_section_text_by_heading(
-        data,
-        ["risk factors", "item 1a"],
-        limit_chars=limit_chars,
-    )
-
-
-def _legal_summary(data, limit_chars=3000):
-    text = _get_section_text_by_path(
-        data,
-        ["LegalProceedings", "PartIIItem1"],
-        limit_chars=limit_chars,
-    )
-    if text:
-        return text
-    commitments = _get_section_text_by_path(
-        data,
-        [
-            "CommitmentsAndContingencies",
-            "CommitmentsandContingencies",
-            "CommitmentsContingencies",
-        ],
-        limit_chars=12000,
-    )
-    if commitments and "legal proceedings" in commitments.lower():
-        idx = commitments.lower().find("legal proceedings")
-        return commitments[idx : idx + limit_chars]
-    return _get_section_text_by_heading(
-        data,
-        ["legal proceedings", "litigation"],
-        limit_chars=limit_chars,
-    )

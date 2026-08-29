@@ -1,8 +1,13 @@
 """
-DeepSeek-Agent für Finanzanalyse.
+LLM-Agent für Finanzanalyse.
 
-Nimmt den Scoring-Output und die extrahierten Finanzdaten entgegen
-und liefert eine strukturierte Einschätzung zur Kursrichtung.
+Konfiguration in .env:
+  LLM_API_KEY:  "your_key"
+  LLM_PROVIDER: "deepseek"     # deepseek | openai | gemini | groq
+  LLM_MODEL:    "deepseek-chat"  # optional — überschreibt den Provider-Default
+
+Für eigene/lokale Endpunkte:
+  LLM_URL: "http://localhost:11434/v1/chat/completions"
 """
 
 import json
@@ -11,8 +16,25 @@ from pathlib import Path
 
 
 BASE_DIR = Path(__file__).parent
-_DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
-_MODEL = "deepseek-chat"
+
+_PROVIDER_DEFAULTS = {
+    "deepseek": {
+        "url":   "https://api.deepseek.com/chat/completions",
+        "model": "deepseek-chat",
+    },
+    "openai": {
+        "url":   "https://api.openai.com/v1/chat/completions",
+        "model": "gpt-4o",
+    },
+    "gemini": {
+        "url":   "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "model": "gemini-2.5-flash",
+    },
+    "groq": {
+        "url":   "https://api.groq.com/openai/v1/chat/completions",
+        "model": "llama-3.3-70b-versatile",
+    },
+}
 
 SYSTEM_PROMPT = """Du bist ein erfahrener Finanzanalyst. Du bekommst strukturierte
 Finanzdaten und einen regelbasierten Score (0–100) für eine Aktie.
@@ -28,16 +50,39 @@ Antworte präzise, auf Deutsch, maximal 300 Wörter.
 Keine Haftungsausschlüsse oder allgemeine Warnungen."""
 
 
-def _load_api_key(key_name: str) -> str:
+def _load_llm_config() -> dict:
+    """
+    Liest LLM-Konfiguration aus .env.
+    URL und Modell werden aus _PROVIDER_DEFAULTS abgeleitet —
+    LLM_URL und LLM_MODEL überschreiben den Default falls angegeben.
+    """
     env_path = BASE_DIR / ".env"
+    env = {}
     for line in env_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or ":" not in line:
             continue
         key, value = line.split(":", 1)
-        if key.strip() == key_name:
-            return value.strip().strip('"').strip("'")
-    raise RuntimeError(f"API-Key '{key_name}' nicht in .env gefunden.")
+        env[key.strip()] = value.strip().strip('"').strip("'")
+
+    if not env.get("LLM_API_KEY"):
+        raise RuntimeError("LLM_API_KEY fehlt in .env.")
+
+    provider = env.get("LLM_PROVIDER", "").lower()
+    defaults = _PROVIDER_DEFAULTS.get(provider, {})
+
+    url   = env.get("LLM_URL")   or defaults.get("url")
+    model = env.get("LLM_MODEL") or defaults.get("model")
+
+    if not url:
+        raise RuntimeError(
+            f"LLM_URL fehlt in .env und Provider '{provider}' ist unbekannt. "
+            f"Bekannte Provider: {', '.join(_PROVIDER_DEFAULTS)}"
+        )
+    if not model:
+        raise RuntimeError("LLM_MODEL fehlt in .env.")
+
+    return {"api_key": env["LLM_API_KEY"], "url": url, "model": model}
 
 
 def _build_prompt(ticker: str, score_result: dict, data_10q: dict, data_10k: dict, data_vantage: dict) -> str:
@@ -54,8 +99,8 @@ def _build_prompt(ticker: str, score_result: dict, data_10q: dict, data_10k: dic
     )
 
     seg_lines = "\n".join(
-        f"  {seg}: Revenue {info.get('revenue', 0)/1e9:.1f}B, "
-        f"Gross Margin {info.get('gross_margin_pct', 0)*100:.1f}%, "
+        f"  {seg}: Revenue {(info.get('revenue') or 0)/1e9:.1f}B, "
+        f"Gross Margin {(info.get('gross_margin_pct') or 0)*100:.1f}%, "
         f"Revenue YoY {(info.get('revenue_yoy_change') or 0)*100:.1f}%"
         for seg, info in segs.items()
     ) or "  Keine Segmentdaten"
@@ -104,17 +149,17 @@ ANALYSTEN:
     return prompt
 
 
-def _call_deepseek(system: str, user: str, max_tokens: int = 600) -> str:
-    """Gemeinsamer API-Call für alle Agent-Funktionen."""
-    api_key = _load_api_key("DeepSeek_API_KEY")
+def _call_llm(system: str, user: str, max_tokens: int = 600) -> str:
+    """Gemeinsamer API-Call — liest Konfiguration aus .env."""
+    cfg = _load_llm_config()
     response = requests.post(
-        _DEEPSEEK_URL,
+        cfg["url"],
         headers={
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {cfg['api_key']}",
             "Content-Type":  "application/json",
         },
         json={
-            "model":       _MODEL,
+            "model":       cfg["model"],
             "messages":    [
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user},
@@ -131,13 +176,13 @@ def _call_deepseek(system: str, user: str, max_tokens: int = 600) -> str:
 def analyze(ticker: str, score_result: dict, data_10k: dict, data_10q: dict, data_vantage: dict) -> str:
     """Gesamteinschätzung: Score-Treiber + Kursrichtung."""
     prompt = _build_prompt(ticker, score_result, data_10q, data_10k, data_vantage)
-    return _call_deepseek(SYSTEM_PROMPT, prompt, max_tokens=600)
+    return _call_llm(SYSTEM_PROMPT, prompt, max_tokens=600)
 
 
 def analyze_mda(ticker: str, data_10k: dict, data_10q: dict, data_vantage: dict) -> str:
     """
     MD&A-Analyse aus numerischen Trends.
-    Da XBRL keinen Narrativtext liefert, rekonstruiert DeepSeek
+    Da XBRL keinen Narrativtext liefert, rekonstruiert der LLM-Agent
     die wahrscheinliche Management-Diskussion aus den Zahlen.
     """
     cm     = data_10q.get("core_metrics", {})
@@ -200,7 +245,7 @@ Aufgabe: Schreibe eine prägnante MD&A-Analyse (max. 250 Wörter) mit den Abschn
 Analysiere die gegebenen Finanzdaten und formuliere eine strukturierte MD&A-Einschätzung.
 Bleib faktenbasiert, präzise und auf Deutsch."""
 
-    return _call_deepseek(system, prompt, max_tokens=700)
+    return _call_llm(system, prompt, max_tokens=700)
 
 
 def extract_guidance(ticker: str, data_10k: dict, data_10q: dict, data_vantage: dict) -> str:
@@ -259,7 +304,7 @@ Aufgabe: Extrahiere die impliziten Forward-Looking-Signale und formuliere max. 2
 Kein Earnings-Call ist verfügbar — extrahiere Zukunftssignale ausschließlich aus den Zahlen.
 Antworte auf Deutsch, präzise und strukturiert."""
 
-    return _call_deepseek(system, prompt, max_tokens=500)
+    return _call_llm(system, prompt, max_tokens=500)
 
 
 def explain_anomalies(ticker: str, score_result: dict, data_10k: dict, data_10q: dict, data_vantage: dict) -> str:
@@ -333,4 +378,4 @@ Aufgabe: Erkläre in max. 200 Wörter:
 Identifiziere Ursachen für unerwartete Score-Muster und ordne sie ein.
 Antworte auf Deutsch, analytisch und präzise."""
 
-    return _call_deepseek(system, prompt, max_tokens=500)
+    return _call_llm(system, prompt, max_tokens=500)
