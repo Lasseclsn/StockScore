@@ -1,4 +1,4 @@
-# Finance Agent
+# StockScore
 
 A CLI tool that fetches SEC filings and market data for a given stock ticker, extracts structured financial metrics, applies a probabilistic scoring model (0–100), and runs four LLM analyses to predict whether a stock price is likely to rise or fall in the next quarter.
 
@@ -9,7 +9,7 @@ A CLI tool that fetches SEC filings and market data for a given stock ticker, ex
 ## Project Structure
 
 ```
-finance_agent/
+StockScore/
 ├── main.py                # Entry point + pipeline orchestration
 ├── extractor.py           # extract_10k(), extract_10q(), extract_vantage()
 ├── financial_metrics.py   # XBRL label constants + numeric fact pickers
