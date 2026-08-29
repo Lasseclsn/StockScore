@@ -494,3 +494,7 @@ JSON output files are saved to `output/<TICKER>_10k.json`, `_10q.json`, `_8k.jso
 - **Alpha Vantage free tier**: Limited to 25 API calls/day. `Forward P/E`, `PEG`, analyst ratings may be unavailable for smaller tickers.
 - **Missing filings**: If a filing cannot be fetched (API error or not found), the corresponding extraction step is skipped gracefully.
 - **SEC rate limits**: `data.sec.gov`/`www.sec.gov` allow up to ~10 requests/second and require the `User-Agent` header set via `SEC_USER_AGENT` — otherwise requests are blocked with a 403.
+
+## License
+
+[MIT](LICENSE)
