@@ -19,8 +19,7 @@ finance_agent/
 ├── get_data.py      # SEC/Alpha Vantage API calls, file I/O
 ├── .env             # API keys (not committed)
 ├── .env.example     # Key name reference
-├── output/          # JSON files saved per ticker (numeric + *_text.json)
-└── system_instruction.json
+└── output/          # JSON files saved per ticker (numeric + *_text.json)
 ```
 
 ### Import chain
