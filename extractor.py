@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from xbrl_helpers import (
+from financial_metrics import (
     LABELS_10k,
     LABELS_10Q,
     _pick,

@@ -10,23 +10,23 @@ A CLI tool that fetches SEC filings and market data for a given stock ticker, ex
 
 ```
 finance_agent/
-├── main.py          # Entry point + pipeline orchestration
-├── extractor.py     # extract_10k(), extract_10q(), extract_vantage()
-├── xbrl_helpers.py  # XBRL label constants + numeric fact pickers
-├── filing_text.py   # Free-text (Risk Factors/MD&A/Legal) + segment data from HTML/R-files
-├── scorer.py        # Scoring model (knockout filters + 5 blocks)
-├── agent.py         # LLM agent (4 analysis functions, multi-provider)
-├── get_data.py      # SEC/Alpha Vantage API calls, file I/O
-├── .env             # API keys (not committed)
-├── .env.example     # Key name reference
-└── output/          # JSON files saved per ticker (numeric + *_text.json)
+├── main.py                # Entry point + pipeline orchestration
+├── extractor.py           # extract_10k(), extract_10q(), extract_vantage()
+├── financial_metrics.py   # XBRL label constants + numeric fact pickers
+├── filing_text.py         # Free-text (Risk Factors/MD&A/Legal) + segment data from HTML/R-files
+├── scorer.py              # Scoring model (knockout filters + 5 blocks)
+├── agent.py               # LLM agent (4 analysis functions, multi-provider)
+├── get_data.py            # SEC/Alpha Vantage API calls, file I/O
+├── .env                   # API keys (not committed)
+├── .env.example           # Key name reference
+└── output/                # JSON files saved per ticker (numeric + *_text.json)
 ```
 
 ### Import chain
 
 ```
 main.py
-  ├── extractor.py  →  xbrl_helpers.py
+  ├── extractor.py  →  financial_metrics.py
   ├── scorer.py
   ├── agent.py
   └── get_data.py  →  filing_text.py
@@ -124,13 +124,13 @@ Handles all external API calls and file I/O. No scoring or extraction logic.
 | `fetch_and_save_filing(filing, cik, ticker, suffix, company_facts)` | Filters `company_facts` down to the facts reported under one filing's accession number, saves to `output/` |
 | `fetch_and_save_overview(ticker)` | Fetches Alpha Vantage OVERVIEW, saves to `output/` |
 
-> **Note on format compatibility**: `_to_period_item()` converts each raw SEC fact (`{"val", "start", "end", "accn", ...}`) into the `{"value", "period": {"startDate"/"endDate" or "instant"}}` shape that `xbrl_helpers.py` expects, so the extraction layer below needed no changes.
+> **Note on format compatibility**: `_to_period_item()` converts each raw SEC fact (`{"val", "start", "end", "accn", ...}`) into the `{"value", "period": {"startDate"/"endDate" or "instant"}}` shape that `financial_metrics.py` expects, so the extraction layer below needed no changes.
 
 ---
 
-## `xbrl_helpers.py` — XBRL Parsing Layer
+## `financial_metrics.py` — Label Constants & Fact Pickers
 
-Contains all label constants and every low-level helper. Nothing in this file makes network calls or reads files.
+Contains all label constants and every low-level numeric-fact helper. Nothing in this file makes network calls or reads files.
 
 ### Label Constants
 
@@ -141,8 +141,6 @@ Each filing type has a mapping dict with fallback chains of XBRL concept names p
 
 **`LABELS_10Q` — `core_metrics`** — quarterly concepts (additional vs 10-K):
 `gross_profit`, `cost_of_revenue`, `inventory`, `accounts_receivable`, `debt_current`, `debt_noncurrent`, `current_assets`, `current_liabilities`, `retained_earnings`, `stockholders_equity`
-
-**`LABELS_8K`** — event flags and metadata fields.
 
 ### Key Helper Functions
 
@@ -166,7 +164,7 @@ Free-text and segment extraction (formerly here) now live in [filing_text.py](fi
 
 ## `extractor.py` — Extraction Layer
 
-Reads the saved JSON output files and returns structured Python dicts. Imports all helpers from `xbrl_helpers.py`.
+Reads the saved JSON output files and returns structured Python dicts. Imports all helpers from `financial_metrics.py`.
 
 ### `extract_10k(path)` → dict
 
@@ -434,7 +432,7 @@ Ranks scoring blocks by fill rate, identifies metrics with 0 points, detects cro
 |---|---|
 | [main.py](main.py) | Entry point, cache check, pipeline orchestration |
 | [extractor.py](extractor.py) | `extract_10k`, `extract_10q`, `extract_vantage` |
-| [xbrl_helpers.py](xbrl_helpers.py) | Label constants, numeric XBRL fact pickers |
+| [financial_metrics.py](financial_metrics.py) | Label constants, numeric XBRL fact pickers |
 | [filing_text.py](filing_text.py) | Freitext (Risk Factors/MD&A/Legal) + Segmentdaten aus HTML/R-Files |
 | [scorer.py](scorer.py) | Knockout filters + 5 scoring blocks |
 | [agent.py](agent.py) | Multi-provider LLM analyses |
